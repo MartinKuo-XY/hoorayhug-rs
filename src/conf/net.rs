@@ -116,6 +116,10 @@ impl Config for NetConf {
             // from endpoint
             bind_address: None,
             bind_interface: None,
+            
+            // ======== 补充新增字段的初始化 ========
+            obfs: String::new(),
+            // ====================================
 
             #[cfg(feature = "balance")]
             balancer: Default::default(),
