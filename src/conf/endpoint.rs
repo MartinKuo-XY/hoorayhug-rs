@@ -20,11 +20,10 @@ pub struct EndpointConf {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_remotes: Vec<String>,
 
-    // ======== 关键新增：解析配置文件的 obfs 字段 ========
+    // ======== 解析配置文件的 obfs 字段 ========
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub obfs: Option<String>,
-    // =================================================
 
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,10 +76,7 @@ impl EndpointConf {
 
     fn build_send_through(&self) -> Option<SocketAddr> {
         let Self { through, .. } = self;
-        let through = match through {
-            Some(x) => x,
-            None => return None,
-        };
+        let through = match through { Some(x) => x, None => return None };
         match through.to_socket_addrs() {
             Ok(mut x) => Some(x.next().unwrap()),
             Err(_) => {
@@ -126,14 +122,11 @@ pub struct EndpointInfo {
 
 impl Config for EndpointConf {
     type Output = EndpointInfo;
-
     fn is_empty(&self) -> bool { false }
-
     fn build(self) -> Self::Output {
         let laddr = self.build_local();
         let raddr = self.build_remote();
         let extra_raddrs = self.extra_remotes.iter().map(|r| Self::build_remote_x(r)).collect();
-
         let NetInfo { mut bind_opts, mut conn_opts, no_tcp, use_udp } = self.network.build();
 
         #[cfg(feature = "balance")] { conn_opts.balancer = self.build_balancer(); }
@@ -143,29 +136,23 @@ impl Config for EndpointConf {
         conn_opts.bind_interface = self.interface;
         bind_opts.bind_interface = self.listen_interface;
         
-        // ======== 塞入配置 ========
         conn_opts.obfs = self.obfs.unwrap_or_default().to_lowercase();
-        // ==========================
 
         EndpointInfo { no_tcp, use_udp, endpoint: Endpoint { laddr, raddr, bind_opts, conn_opts, extra_raddrs } }
     }
-
     fn rst_field(&mut self, _: &Self) -> &mut Self { unreachable!() }
     fn take_field(&mut self, _: &Self) -> &mut Self { unreachable!() }
-
     fn from_cmd_args(matches: &clap::ArgMatches) -> Self {
-        let listen = matches.get_one("local").cloned().unwrap();
-        let remote = matches.get_one("remote").cloned().unwrap();
-        let through = matches.get_one("through").cloned();
-        let interface = matches.get_one("interface").cloned();
-        let listen_interface = matches.get_one("listen_interface").cloned();
-        let listen_transport = matches.get_one("listen_transport").cloned();
-        let remote_transport = matches.get_one("remote_transport").cloned();
-
         EndpointConf {
-            listen, remote, through, interface, listen_interface, listen_transport, remote_transport,
+            listen: matches.get_one::<String>("local").cloned().unwrap(),
+            remote: matches.get_one::<String>("remote").cloned().unwrap(),
+            through: matches.get_one::<String>("through").cloned(),
+            interface: matches.get_one::<String>("interface").cloned(),
+            listen_interface: matches.get_one::<String>("listen_interface").cloned(),
+            listen_transport: matches.get_one::<String>("listen_transport").cloned(),
+            remote_transport: matches.get_one::<String>("remote_transport").cloned(),
             network: Default::default(), extra_remotes: Vec::new(), balance: None,
-            obfs: None, // 命令行参数暂不处理此配置
+            obfs: None,
         }
     }
 }
