@@ -57,19 +57,15 @@ pub async fn run_tcp(endpoint: Endpoint) -> Result<()> {
         }
 
         // ============================================================
-        // 将配置文件的字符串转换为数字，准备传给底层
+        // 挂载你设计的协议上下文
         // ============================================================
         let mode_num = match conn_opts.obfs.as_str() {
             "client" => 1,
             "server" => 2,
-            _ => 0, // 如果没有配，或者配成了别的，就是普通转发
+            _ => 0,
         };
 
         tokio::spawn(async move {
-            // ============================================================
-            // 核心魔法：用 OBFS_MODE.scope 包裹运行！
-            // 在这个 task 里，底层任何深度的代码调用 get_obfs_mode() 都会拿到准确的值！
-            // ============================================================
             hoorayhug_io::mem_copy::OBFS_MODE.scope(mode_num, async move {
                 match connect_and_relay(local, raddr, conn_opts, extra_raddrs).await {
                     Ok(..) => log::debug!("[tcp]{} => {}, finish", addr, raddr.as_ref()),
