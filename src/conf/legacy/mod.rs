@@ -78,6 +78,10 @@ impl From<LegacyConf> for FullConf {
                 network: Default::default(),
                 extra_remotes: Vec::new(),
                 balance: None,
+                
+                // ======== 这里是刚刚缺少的字段 ========
+                obfs: None,
+                // ===================================
             })
             .collect();
 
