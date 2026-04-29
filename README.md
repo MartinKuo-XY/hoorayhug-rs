@@ -1,1 +1,1 @@
-# hoorayhug-rs
+# hoorayhug
