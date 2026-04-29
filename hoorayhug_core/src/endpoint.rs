@@ -9,6 +9,7 @@ use kaminari::mix::{MixAccept, MixConnect};
 #[cfg(feature = "balance")]
 use hoorayhug_lb::Balancer;
 
+/// Remote address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteAddr {
     SocketAddr(SocketAddr),
@@ -42,9 +43,9 @@ pub struct ConnectOpts {
     pub bind_address: Option<SocketAddr>,
     pub bind_interface: Option<String>,
     
-    // ======== 新增字段 ========
+    // ======== 新增混淆字段 ========
     pub obfs: String, 
-    // =========================
+    // =============================
 
     #[cfg(feature = "proxy")]
     pub proxy_opts: ProxyOpts,
@@ -85,7 +86,9 @@ impl Display for RemoteAddr {
 impl Display for Endpoint {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} -> [{}", &self.laddr, &self.raddr)?;
-        for raddr in self.extra_raddrs.iter() { write!(f, "|{}", raddr)?; }
+        for raddr in self.extra_raddrs.iter() {
+            write!(f, "|{}", raddr)?;
+        }
         write!(f, "]; options: {}; {}", &self.bind_opts, &self.conn_opts)
     }
 }
@@ -93,7 +96,9 @@ impl Display for Endpoint {
 impl Display for BindOpts {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let BindOpts { accept_mptcp, ipv6_only, bind_interface } = self;
-        if let Some(iface) = bind_interface { write!(f, "listen-iface={}, ", iface)?; }
+        if let Some(iface) = bind_interface {
+            write!(f, "listen-iface={}, ", iface)?;
+        }
         write!(f, "ipv6-only={}, ", ipv6_only)?;
         write!(f, "accept-mptcp={}", accept_mptcp)?;
         Ok(())
@@ -104,7 +109,7 @@ impl Display for ConnectOpts {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let ConnectOpts {
             send_mptcp, connect_timeout, associate_timeout, tcp_keepalive, tcp_keepalive_probe,
-            bind_address, bind_interface, obfs, // <-- 格式化新增字段
+            bind_address, bind_interface, obfs,
             #[cfg(feature = "proxy")] proxy_opts,
             #[cfg(feature = "transport")] transport,
             #[cfg(feature = "balance")] balancer,
@@ -112,10 +117,7 @@ impl Display for ConnectOpts {
 
         if let Some(iface) = bind_interface { write!(f, "send-iface={}, ", iface)?; }
         if let Some(send_through) = bind_address { write!(f, "send-through={}, ", send_through)?; }
-        
-        // 打印出混淆模式，方便调试看日志
         if !obfs.is_empty() { write!(f, "obfs={}, ", obfs)?; }
-
         write!(f, "send-mptcp={}; ", send_mptcp)?;
 
         #[cfg(feature = "proxy")]
