@@ -50,15 +50,17 @@ pub async fn run_tcp(endpoint: Endpoint) -> Result<()> {
             }
         };
 
-        let _ = local.set_nodelay(true);
+        // ============================================================
+        // 【修改点】: 彻底删除了 let _ = local.set_nodelay(true);
+        // 保留 Nagle 算法，使得混淆首包和真实数据能被内核合并为一个包发送
+        // ============================================================
+        
         if let Some(kpa) = &keepalive {
             use socket::keepalive::SockRef;
             SockRef::from(&local).set_tcp_keepalive(kpa)?;
         }
 
-        // ============================================================
         // 挂载你设计的协议上下文
-        // ============================================================
         let mode_num = match conn_opts.obfs.as_str() {
             "client" => 1,
             "server" => 2,
