@@ -1,215 +1,109 @@
-use std::future::Future;
-use std::io;
+use std::io::Result;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use std::task::{Poll, Context};
 
-// ==========================================================
-// 全局配置与状态
-// ==========================================================
-static BUF_SIZE: AtomicUsize = AtomicUsize::new(8192);
+use tokio::io::ReadBuf;
+use tokio::io::{AsyncRead, AsyncWrite};
 
-#[inline]
-pub fn set_buf_size(n: usize) {
-    BUF_SIZE.store(n, Ordering::Relaxed);
-}
+use super::{CopyBuffer, AsyncIOBuf};
+use super::bidi_copy_buf;
 
-#[inline]
-pub fn buf_size() -> usize {
-    BUF_SIZE.load(Ordering::Relaxed)
-}
-
+// ==============================================================
+// Tokio 协程本地存储 (Task Local)
+// 0: 原版普通转发 | 1: Client混淆客户端 | 2: Server混淆服务端
+// ==============================================================
 tokio::task_local! {
     pub static OBFS_MODE: u8;
 }
 
-#[inline]
 pub fn get_obfs_mode() -> u8 {
-    OBFS_MODE.try_with(|&m| m).unwrap_or(0)
+    OBFS_MODE.try_with(|x| *x).unwrap_or(0)
 }
+// ==============================================================
 
-// ==========================================================
-// 核心拷贝缓冲区 (Chunking + XOR 混淆)
-// ==========================================================
-pub struct CopyBuffer {
-    read_done: bool,
-    need_flush: bool,
-    pos: usize,
-    cap: usize,
-    amt: u64,
-    buf: Box<[u8]>,
-}
+impl<B, SR, SW> AsyncIOBuf for CopyBuffer<B, SR, SW>
+where
+    B: AsMut<[u8]>,
+    SR: AsyncRead + AsyncWrite + Unpin,
+    SW: AsyncRead + AsyncWrite + Unpin,
+{
+    type StreamR = SR;
+    type StreamW = SW;
 
-impl CopyBuffer {
-    pub fn new() -> Self {
-        Self {
-            read_done: false,
-            need_flush: false,
-            pos: 0,
-            cap: 0,
-            amt: 0,
-            buf: vec![0; buf_size()].into_boxed_slice(),
+    #[inline]
+    fn poll_read_buf(&mut self, cx: &mut Context<'_>, stream: &mut Self::StreamR) -> Poll<Result<usize>> {
+        // ================= 新增：Chunking 随机碎包逻辑 =================
+        let max_len = self.buf.as_mut().len();
+        let mut target_len = max_len;
+
+        // 如果缓冲区大于128，并且处于混淆模式，则强行缩小本次允许读取的缓冲区大小
+        if max_len > 128 && get_obfs_mode() != 0 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos();
+            
+            // nanos % 16 会产生 0~15。 12 + 0~15 = 12% ~ 27% 裁剪率
+            let cut_percent = 12 + (nanos % 16) as usize; 
+            
+            // 计算裁剪掉的大小，让 target_len 只剩下原来的 73% ~ 88%
+            let cut_size = (max_len * cut_percent) / 100;
+            target_len = max_len - cut_size;
         }
-    }
 
-    pub fn poll_copy<R, W>(
-        &mut self,
-        cx: &mut Context<'_>,
-        mut r: Pin<&mut R>,
-        mut w: Pin<&mut W>,
-    ) -> Poll<io::Result<u64>>
-    where
-        R: AsyncRead + ?Sized,
-        W: AsyncWrite + ?Sized,
-    {
-        loop {
-            // 1. 如果缓冲区空了，且没读完，就向内核读取数据
-            if self.pos == self.cap && !self.read_done {
-                let max_len = self.buf.len();
-                let mut target_len = max_len;
-
-                // 【混淆核心 1】：安全的随机碎包 (Chunking 12% ~ 27%)
-                if max_len > 128 && get_obfs_mode() != 0 {
-                    let nanos = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .subsec_nanos();
-                    
-                    let cut_percent = 12 + (nanos % 16) as usize; 
-                    let cut_size = (max_len * cut_percent) / 100;
-                    target_len = max_len - cut_size;
-                }
-
-                let mut read_buf = ReadBuf::new(&mut self.buf[..target_len]);
+        // 用被随机截断后的目标长度创建 ReadBuf
+        let mut buf = ReadBuf::new(&mut self.buf.as_mut()[..target_len]);
+        // ===============================================================
+        
+        match Pin::new(stream).poll_read(cx, &mut buf) {
+            Poll::Ready(Ok(())) => {
+                let len = buf.filled().len();
                 
-                match r.as_mut().poll_read(cx, &mut read_buf) {
-                    Poll::Ready(Ok(())) => {
-                        let n = read_buf.filled().len();
-                        if n == 0 {
-                            self.read_done = true;
-                        } else {
-                            self.pos = 0;
-                            self.cap = n;
-
-                            // 【混淆核心 2】：XOR 流量变异
-                            if get_obfs_mode() != 0 {
-                                let slice = &mut self.buf[..n];
-                                for byte in slice.iter_mut() {
-                                    *byte ^= 0x5A;
-                                }
-                            }
-                        }
-                    }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                    Poll::Pending => {
-                        if !self.need_flush {
-                            return Poll::Pending;
+                // 动态检查：只要 mode 不是 0，就对后续全流数据进行 XOR 混淆
+                if len > 0 {
+                    if get_obfs_mode() != 0 {
+                        let slice = &mut self.buf.as_mut()[..len];
+                        for byte in slice.iter_mut() {
+                            *byte ^= 0x5A; // 核心 XOR 密钥
                         }
                     }
                 }
+                
+                Poll::Ready(Ok(len))
             }
-
-            // 2. 如果缓冲区有数据，就往外写
-            while self.pos < self.cap {
-                match w.as_mut().poll_write(cx, &self.buf[self.pos..self.cap]) {
-                    Poll::Ready(Ok(0)) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "write zero byte into writer",
-                        )));
-                    }
-                    Poll::Ready(Ok(n)) => {
-                        self.pos += n;
-                        self.amt += n as u64;
-                        self.need_flush = true;
-                    }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-
-            // 3. 刷新数据
-            if self.pos == self.cap && self.need_flush {
-                match w.as_mut().poll_flush(cx) {
-                    Poll::Ready(Ok(())) => {
-                        self.need_flush = false;
-                    }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-
-            // 4. 传输完成
-            if self.read_done && self.pos == self.cap {
-                return Poll::Ready(Ok(self.amt));
-            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
         }
+    }
+
+    #[inline]
+    fn poll_write_buf(&mut self, cx: &mut Context<'_>, stream: &mut Self::StreamW) -> Poll<Result<usize>> {
+        Pin::new(stream).poll_write(cx, &self.buf.as_mut()[self.pos..self.cap])
+    }
+
+    #[inline]
+    fn poll_flush_buf(&mut self, cx: &mut Context<'_>, stream: &mut Self::StreamW) -> Poll<Result<()>> {
+        Pin::new(stream).poll_flush(cx)
     }
 }
 
-// ==========================================================
-// 修复借用检查：纯底层手写的双向拷贝状态机
-// ==========================================================
-struct BidiCopy<'a, A: ?Sized, B: ?Sized> {
-    a: &'a mut A,
-    b: &'a mut B,
-    a_to_b: CopyBuffer,
-    b_to_a: CopyBuffer,
-    a_to_b_done: bool,
-    b_to_a_done: bool,
-}
-
-impl<'a, A, B> Future for BidiCopy<'a, A, B>
+pub async fn bidi_copy<A, B>(a: &mut A, b: &mut B) -> Result<(u64, u64)>
 where
-    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
-    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
 {
-    type Output = io::Result<(u64, u64)>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let me = &mut *self;
-
-        // 轮询 A -> B
-        // 注意这里：借用在 poll_copy 调用结束后立刻释放，不会冲突
-        if !me.a_to_b_done {
-            match me.a_to_b.poll_copy(cx, Pin::new(&mut *me.a), Pin::new(&mut *me.b)) {
-                Poll::Ready(Ok(_)) => me.a_to_b_done = true,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {}
-            }
-        }
-
-        // 轮询 B -> A
-        if !me.b_to_a_done {
-            match me.b_to_a.poll_copy(cx, Pin::new(&mut *me.b), Pin::new(&mut *me.a)) {
-                Poll::Ready(Ok(_)) => me.b_to_a_done = true,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {}
-            }
-        }
-
-        // 只有双向都彻底结束，才返回 Ready
-        if me.a_to_b_done && me.b_to_a_done {
-            Poll::Ready(Ok((me.a_to_b.amt, me.b_to_a.amt)))
-        } else {
-            Poll::Pending
-        }
-    }
+    let a_to_b_buf = CopyBuffer::new(vec![0u8; buf_size()].into_boxed_slice());
+    let b_to_a_buf = CopyBuffer::new(vec![0u8; buf_size()].into_boxed_slice());
+    bidi_copy_buf(a, b, a_to_b_buf, b_to_a_buf).await
 }
 
-pub async fn bidi_copy<A, B>(a: &mut A, b: &mut B) -> io::Result<(u64, u64)>
-where
-    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
-    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
-{
-    BidiCopy {
-        a,
-        b,
-        a_to_b: CopyBuffer::new(),
-        b_to_a: CopyBuffer::new(),
-        a_to_b_done: false,
-        b_to_a_done: false,
-    }
-    .await
+mod buf_ctl {
+    pub const DF_BUF_SIZE: usize = 0x2000;
+    static mut BUF_SIZE: usize = DF_BUF_SIZE;
+    #[inline]
+    pub fn buf_size() -> usize { unsafe { BUF_SIZE } }
+    #[inline]
+    pub fn set_buf_size(n: usize) { unsafe { BUF_SIZE = n } }
 }
+
+pub use buf_ctl::{buf_size, set_buf_size};
