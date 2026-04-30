@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 // ==========================================================
-// 原版 Realm 必须的全局函数 (修复报错)
+// 全局配置与状态
 // ==========================================================
 static BUF_SIZE: AtomicUsize = AtomicUsize::new(8192);
 
@@ -20,21 +20,17 @@ pub fn buf_size() -> usize {
     BUF_SIZE.load(Ordering::Relaxed)
 }
 
-// ==========================================================
-// 我们的混淆核心上下文
-// ==========================================================
 tokio::task_local! {
     pub static OBFS_MODE: u8;
 }
 
-// 安全获取模式的辅助函数
 #[inline]
 pub fn get_obfs_mode() -> u8 {
     OBFS_MODE.try_with(|&m| m).unwrap_or(0)
 }
 
 // ==========================================================
-// 核心拷贝缓冲区逻辑 (加入 Chunking 和 XOR)
+// 核心拷贝缓冲区 (Chunking + XOR 混淆)
 // ==========================================================
 pub struct CopyBuffer {
     read_done: bool,
@@ -53,7 +49,6 @@ impl CopyBuffer {
             pos: 0,
             cap: 0,
             amt: 0,
-            // 动态读取全局设定的 buf_size
             buf: vec![0; buf_size()].into_boxed_slice(),
         }
     }
@@ -74,20 +69,15 @@ impl CopyBuffer {
                 let max_len = self.buf.len();
                 let mut target_len = max_len;
 
-                // ============================================================
-                // 【混淆特征】：安全的 Chunking (随机裁剪)
-                // ============================================================
+                // 【混淆核心 1】：安全的随机碎包 (Chunking 12% ~ 27%)
                 if max_len > 128 && get_obfs_mode() != 0 {
-                    // 使用纳秒获取伪随机数
                     let nanos = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .subsec_nanos();
                     
-                    // nanos % 16 会产生 0~15。 12 + 0~15 = 12% ~ 27% 裁剪率
                     let cut_percent = 12 + (nanos % 16) as usize; 
                     let cut_size = (max_len * cut_percent) / 100;
-                    
                     target_len = max_len - cut_size;
                 }
 
@@ -102,9 +92,7 @@ impl CopyBuffer {
                             self.pos = 0;
                             self.cap = n;
 
-                            // ============================================================
-                            // 【混淆特征】：XOR 混淆消除明文指纹
-                            // ============================================================
+                            // 【混淆核心 2】：XOR 流量变异
                             if get_obfs_mode() != 0 {
                                 let slice = &mut self.buf[..n];
                                 for byte in slice.iter_mut() {
@@ -161,24 +149,52 @@ impl CopyBuffer {
 }
 
 // ==========================================================
-// 原版 Realm 必须的双向拷贝封装 (修复 bidi_copy 找不到的报错)
+// 修复借用检查：纯底层手写的双向拷贝状态机
 // ==========================================================
-struct Copy<'a, R: ?Sized, W: ?Sized> {
-    reader: &'a mut R,
-    writer: &'a mut W,
-    buf: CopyBuffer,
+struct BidiCopy<'a, A: ?Sized, B: ?Sized> {
+    a: &'a mut A,
+    b: &'a mut B,
+    a_to_b: CopyBuffer,
+    b_to_a: CopyBuffer,
+    a_to_b_done: bool,
+    b_to_a_done: bool,
 }
 
-impl<R, W> Future for Copy<'_, R, W>
+impl<'a, A, B> Future for BidiCopy<'a, A, B>
 where
-    R: AsyncRead + Unpin + ?Sized,
-    W: AsyncWrite + Unpin + ?Sized,
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    type Output = io::Result<u64>;
+    type Output = io::Result<(u64, u64)>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = &mut *self;
-        me.buf.poll_copy(cx, Pin::new(&mut *me.reader), Pin::new(&mut *me.writer))
+
+        // 轮询 A -> B
+        // 注意这里：借用在 poll_copy 调用结束后立刻释放，不会冲突
+        if !me.a_to_b_done {
+            match me.a_to_b.poll_copy(cx, Pin::new(&mut *me.a), Pin::new(&mut *me.b)) {
+                Poll::Ready(Ok(_)) => me.a_to_b_done = true,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {}
+            }
+        }
+
+        // 轮询 B -> A
+        if !me.b_to_a_done {
+            match me.b_to_a.poll_copy(cx, Pin::new(&mut *me.b), Pin::new(&mut *me.a)) {
+                Poll::Ready(Ok(_)) => me.b_to_a_done = true,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {}
+            }
+        }
+
+        // 只有双向都彻底结束，才返回 Ready
+        if me.a_to_b_done && me.b_to_a_done {
+            Poll::Ready(Ok((me.a_to_b.amt, me.b_to_a.amt)))
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -187,18 +203,13 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    let copy_a_to_b = Copy {
-        reader: a,
-        writer: b,
-        buf: CopyBuffer::new(),
-    };
-
-    let copy_b_to_a = Copy {
-        reader: b,
-        writer: a,
-        buf: CopyBuffer::new(),
-    };
-
-    // 并发执行 A->B 和 B->A 的流量转发
-    tokio::try_join!(copy_a_to_b, copy_b_to_a)
+    BidiCopy {
+        a,
+        b,
+        a_to_b: CopyBuffer::new(),
+        b_to_a: CopyBuffer::new(),
+        a_to_b_done: false,
+        b_to_a_done: false,
+    }
+    .await
 }
