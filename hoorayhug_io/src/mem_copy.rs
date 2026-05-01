@@ -67,7 +67,7 @@ where
         let mut buf = ReadBuf::new(&mut self.buf.as_mut()[..target_len]);
         // ===============================================================
         
-        match Pin::new(stream).poll_read(cx, &mut buf) {
+        match Pin::new(&mut *stream).poll_read(cx, &mut buf) {
             Poll::Ready(Ok(())) => {
                 let len = buf.filled().len();
                 
@@ -91,12 +91,12 @@ where
 
     #[inline]
     fn poll_write_buf(&mut self, cx: &mut Context<'_>, stream: &mut Self::StreamW) -> Poll<Result<usize>> {
-        Pin::new(stream).poll_write(cx, &self.buf.as_mut()[self.pos..self.cap])
+        Pin::new(&mut *stream).poll_write(cx, &self.buf.as_mut()[self.pos..self.cap])
     }
 
     #[inline]
     fn poll_flush_buf(&mut self, cx: &mut Context<'_>, stream: &mut Self::StreamW) -> Poll<Result<()>> {
-        Pin::new(stream).poll_flush(cx)
+        Pin::new(&mut *stream).poll_flush(cx)
     }
 }
 
