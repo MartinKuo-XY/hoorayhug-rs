@@ -33,37 +33,37 @@ where
     #[inline]
     fn poll_read_buf(&mut self, cx: &mut Context<'_>, stream: &mut Self::StreamR) -> Poll<Result<usize>> {
         // ===============================================================
-        // 【核心修改】：Chunking 随机碎包逻辑 (7% ~ 92%)
+        // 【核心修改】：精确到单字节（个位数）的强随机 Chunking (7% ~ 92%)
         // ===============================================================
-        let max_len = self.buf.as_mut().len();
-        let mut target_len = max_len;
+        let max_cap = self.buf.as_mut().len();
+        let mut target_len = max_cap;
 
-        // 仅对较大的缓冲区进行切片，避免极小的数据包（如握手包）被过度碎化导致卡顿
-        if max_len > 128 && get_obfs_mode() != 0 {
-            // 1. 获取系统时间的纳秒级作为伪随机数种子 (极快，无需额外依赖 rand 库)
+        // 仅对较大的缓冲区进行切片，避免极小的数据包被过度碎化
+        if max_cap > 128 && get_obfs_mode() != 0 {
+            // 1. 获取纳秒作为种子
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .subsec_nanos();
+                .subsec_nanos() as usize;
             
-            // 2. 计算我们要“保留（读取）”的百分比：7% 到 92%
-            // 算法解析：
-            // - 最大值 92，最小值 7。 范围跨度 = 92 - 7 + 1 = 86
-            // - 对 86 取模 (nanos % 86) 必然得到 0 到 85 之间的纯随机整数
-            // - 加上底数 7：(0~85) + 7 = 7 到 92
-            let read_percent = 7 + (nanos % 86) as usize; 
+            // 2. 计算 7% 和 92% 的精确【绝对字节数】
+            let min_bytes = (max_cap * 7) / 100;
+            let max_bytes = (max_cap * 92) / 100;
             
-            // 3. 直接算出本次切片后允许读取的目标长度
-            target_len = (max_len * read_percent) / 100;
+            // 3. 在 min_bytes 和 max_bytes 之间取纯随机数
+            // 例如：min=573, max=7536，跨度 range = 6964
+            // nanos % 6964 会得到 0~6963 之间精确到个位数的任何一个值
+            // 最后加上 min_bytes，得到 573~7536 之间极其均匀的单字节分布！
+            let range = max_bytes - min_bytes + 1;
+            target_len = min_bytes + (nanos % range);
 
-            // 4. 安全兜底：如果算出来是 0 (比如 max_len=130，算出来7%是9.1，向下取整极少数情况出错时)
-            // 强制最少读取 1 个字节，防止 TCP 状态机死锁（无限等待）
+            // 4. 安全兜底：如果算出是 0，强行保底 1 字节
             if target_len == 0 {
                 target_len = 1;
             }
         }
 
-        // 用被随机截断后的目标长度创建 ReadBuf，欺骗内核只返回这么点数据
+        // 用被随机截断后的目标长度创建 ReadBuf
         let mut buf = ReadBuf::new(&mut self.buf.as_mut()[..target_len]);
         // ===============================================================
         
@@ -71,7 +71,8 @@ where
             Poll::Ready(Ok(())) => {
                 let len = buf.filled().len();
                 
-                // 动态检查：只要 mode 不是 0，就对本次读取的数据进行 XOR 混淆
+                // 动态检查：只要 mode 不是 0，就对后续全流数据进行 XOR 混淆
+                // XOR 是逐字节进行的，完全不受前面切出了多少个单字节的影响！
                 if len > 0 {
                     if get_obfs_mode() != 0 {
                         let slice = &mut self.buf.as_mut()[..len];
