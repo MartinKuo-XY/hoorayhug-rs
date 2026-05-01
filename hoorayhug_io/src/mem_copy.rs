@@ -32,26 +32,38 @@ where
 
     #[inline]
     fn poll_read_buf(&mut self, cx: &mut Context<'_>, stream: &mut Self::StreamR) -> Poll<Result<usize>> {
-        // ================= 新增：Chunking 随机碎包逻辑 =================
+        // ===============================================================
+        // 【核心修改】：Chunking 随机碎包逻辑 (7% ~ 92%)
+        // ===============================================================
         let max_len = self.buf.as_mut().len();
         let mut target_len = max_len;
 
-        // 如果缓冲区大于128，并且处于混淆模式，则强行缩小本次允许读取的缓冲区大小
+        // 仅对较大的缓冲区进行切片，避免极小的数据包（如握手包）被过度碎化导致卡顿
         if max_len > 128 && get_obfs_mode() != 0 {
+            // 1. 获取系统时间的纳秒级作为伪随机数种子 (极快，无需额外依赖 rand 库)
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .subsec_nanos();
             
-            // nanos % 16 会产生 0~15。 12 + 0~15 = 12% ~ 27% 裁剪率
-            let cut_percent = 12 + (nanos % 16) as usize; 
+            // 2. 计算我们要“保留（读取）”的百分比：7% 到 92%
+            // 算法解析：
+            // - 最大值 92，最小值 7。 范围跨度 = 92 - 7 + 1 = 86
+            // - 对 86 取模 (nanos % 86) 必然得到 0 到 85 之间的纯随机整数
+            // - 加上底数 7：(0~85) + 7 = 7 到 92
+            let read_percent = 7 + (nanos % 86) as usize; 
             
-            // 计算裁剪掉的大小，让 target_len 只剩下原来的 73% ~ 88%
-            let cut_size = (max_len * cut_percent) / 100;
-            target_len = max_len - cut_size;
+            // 3. 直接算出本次切片后允许读取的目标长度
+            target_len = (max_len * read_percent) / 100;
+
+            // 4. 安全兜底：如果算出来是 0 (比如 max_len=130，算出来7%是9.1，向下取整极少数情况出错时)
+            // 强制最少读取 1 个字节，防止 TCP 状态机死锁（无限等待）
+            if target_len == 0 {
+                target_len = 1;
+            }
         }
 
-        // 用被随机截断后的目标长度创建 ReadBuf
+        // 用被随机截断后的目标长度创建 ReadBuf，欺骗内核只返回这么点数据
         let mut buf = ReadBuf::new(&mut self.buf.as_mut()[..target_len]);
         // ===============================================================
         
@@ -59,7 +71,7 @@ where
             Poll::Ready(Ok(())) => {
                 let len = buf.filled().len();
                 
-                // 动态检查：只要 mode 不是 0，就对后续全流数据进行 XOR 混淆
+                // 动态检查：只要 mode 不是 0，就对本次读取的数据进行 XOR 混淆
                 if len > 0 {
                     if get_obfs_mode() != 0 {
                         let slice = &mut self.buf.as_mut()[..len];
